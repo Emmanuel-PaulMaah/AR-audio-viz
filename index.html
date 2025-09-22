@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AR-ish Audio Visualizer (Smallest Demo)</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #app { position: relative; width: 100%; height: 100%; }
+    video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); /* mirror selfie-style */ }
+    canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+    .hud { position: absolute; left: 12px; bottom: 12px; color: #fff; background: rgba(0,0,0,0.35); padding: 8px 10px; border-radius: 10px; font-size: 14px; line-height: 1.2; }
+    .btns { position: absolute; right: 12px; bottom: 12px; display: flex; gap: 8px; }
+    button { appearance: none; border: 0; padding: 10px 14px; border-radius: 12px; background: rgba(255,255,255,0.12); color: #fff; cursor: pointer; font-weight: 600; backdrop-filter: blur(6px); }
+    button:hover{ background: rgba(255,255,255,0.2);} 
+    .warn { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); color: #fff; background: #e63946; padding: 8px 12px; border-radius: 8px; display: none; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div class="warn" id="warn">allow camera + microphone to run the demo</div>
+    <video id="cam" playsinline autoplay muted></video>
+    <canvas id="overlay"></canvas>
+
+    <div class="hud" id="hud">—</div>
+    <div class="btns">
+      <button id="start">start</button>
+      <button id="flip">flip cam</button>
+    </div>
+  </div>
+
+<script>
+(async function(){
+  const camEl = document.getElementById('cam');
+  const canvas = document.getElementById('overlay');
+  const hud = document.getElementById('hud');
+  const warn = document.getElementById('warn');
+  const startBtn = document.getElementById('start');
+  const flipBtn = document.getElementById('flip');
+
+  let facingMode = 'user';
+  let stream = null;
+  let audioCtx = null, analyser = null, source = null;
+  let timeData = null, freqData = null;
+  let rafId = null;
+
+  const W = () => canvas.width = canvas.clientWidth * devicePixelRatio;
+  const H = () => canvas.height = canvas.clientHeight * devicePixelRatio;
+  const ctx = canvas.getContext('2d');
+
+  function dbToGain(db){ return Math.pow(10, db/20); }
+
+  function getRMS(buf){
+    let sum = 0;
+    for (let i=0;i<buf.length;i++){ const v = (buf[i]-128)/128; sum += v*v; }
+    return Math.sqrt(sum / buf.length);
+  }
+
+  function getZCR(buf){
+    let z=0; let prev = (buf[0]-128)/128;
+    for(let i=1;i<buf.length;i++){ const cur=(buf[i]-128)/128; if((prev>=0 && cur<0) || (prev<0 && cur>=0)) z++; prev=cur; }
+    return z / buf.length; // ~0..0.5
+  }
+
+  function getSpectralCentroid(freq, sampleRate){
+    // freq is Float32Array in dB. Convert to magnitude and compute centroid.
+    const N = freq.length; let magSum=0, weighted=0;
+    for(let i=0;i<N;i++){
+      const f = i * (sampleRate/2) / N; // bin freq
+      const m = dbToGain(freq[i]);
+      magSum += m; weighted += f * m;
+    }
+    return magSum>0 ? (weighted/magSum) : 0;
+  }
+
+  function autocorrPitch(buf, sampleRate){
+    // Simple ACF pitch detector on time-domain (uint8) buffer. Returns Hz or 0.
+    // Downmix to float [-1,1]
+    const N = buf.length; const fbuf = new Float32Array(N);
+    for(let i=0;i<N;i++) fbuf[i] = (buf[i]-128)/128;
+
+    // remove DC
+    let mean=0; for(let i=0;i<N;i++) mean+=fbuf[i]; mean/=N; for(let i=0;i<N;i++) fbuf[i]-=mean;
+
+    // ACF
+    let maxLag = Math.floor(sampleRate/70); // ~70 Hz low bound
+    let minLag = Math.floor(sampleRate/500); // ~500 Hz high bound (speech fundamental)
+    let bestLag=0, best=0;
+    for(let lag=minLag; lag<=maxLag; lag++){
+      let sum=0; for(let i=0;i<N-lag;i++) sum += fbuf[i]*fbuf[i+lag];
+      if(sum>best){ best=sum; bestLag=lag; }
+    }
+    // normalize by energy
+    let energy=0; for(let i=0;i<N;i++) energy+=fbuf[i]*fbuf[i];
+    const clarity = energy>0 ? best/energy : 0;
+    const pitch = bestLag>0 ? sampleRate/bestLag : 0;
+    return clarity>0.3 ? pitch : 0; // crude voicing threshold
+  }
+
+  function classify({rms,zcr,centroid,pitch}){
+    // Very small heuristic classifier: speech / music / noise / silence
+    if (rms < 0.01) return {label:'silence', color:'#9aa0a6'};
+
+    const voiced = pitch>80 && pitch<350; // human speech-ish F0
+    const bright = centroid>2500; // Hz
+
+    // Heuristics
+    if (voiced && !bright && zcr < 0.15) return {label:'speech', color:'#4ade80'}; // green
+
+    if (!voiced && zcr < 0.1 && centroid < 1200) return {label:'music', color:'#60a5fa'}; // blue
+
+    return {label:'noise', color:'#f97316'}; // orange
+  }
+
+  async function start(){
+    try{
+      warn.style.display = 'block';
+      if (stream) stream.getTracks().forEach(t=>t.stop());
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false },
+        video: { facingMode }
+      });
+      camEl.srcObject = stream;
+
+      // audio graph
+      audioCtx?.close();
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      source = audioCtx.createMediaStreamSource(stream);
+      analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 2048; // 1024 bins
+      analyser.smoothingTimeConstant = 0.5; // visual stability
+      source.connect(analyser);
+
+      timeData = new Uint8Array(analyser.fftSize);
+      freqData = new Float32Array(analyser.frequencyBinCount);
+
+      resize();
+      loop();
+      warn.style.display = 'none';
+    }catch(e){
+      console.error(e);
+      warn.textContent = 'permission required: camera + mic ('+e.message+')';
+      warn.style.display = 'block';
+    }
+  }
+
+  function resize(){ W(); H(); }
+  window.addEventListener('resize', resize);
+
+  function loop(){
+    rafId = requestAnimationFrame(loop);
+    if(!analyser) return;
+
+    analyser.getByteTimeDomainData(timeData);
+    analyser.getFloatFrequencyData(freqData);
+
+    const rms = getRMS(timeData);
+    const zcr = getZCR(timeData);
+    const centroid = getSpectralCentroid(freqData, audioCtx.sampleRate);
+    const pitch = autocorrPitch(timeData, audioCtx.sampleRate);
+
+    const {label, color} = classify({rms,zcr,centroid,pitch});
+
+    // Draw overlay: a pulsing orb locked to center (AR-ish HUD)
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0,0,w,h);
+    const cx = w*0.5, cy = h*0.6;
+    const base = Math.min(w,h)*0.08;
+    const radius = base + rms*base*10; // loudness → size
+
+    // glow
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius*1.4, 0, Math.PI*2);
+    ctx.fillStyle = color + '33';
+    ctx.fill();
+
+    // core
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI*2);
+    ctx.fillStyle = color;
+    ctx.fill();
+
+    // ring jitter from zcr
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius*1.6 + zcr*60, 0, Math.PI*2);
+    ctx.lineWidth = 4 * devicePixelRatio;
+    ctx.strokeStyle = '#ffffff80';
+    ctx.stroke();
+
+    // HUD text
+    hud.innerHTML = `${label.toUpperCase()}<br>rms ${rms.toFixed(3)} · zcr ${zcr.toFixed(3)} · sc ${Math.round(centroid)}Hz${pitch?` · f0 ${Math.round(pitch)}Hz`:''}`;
+  }
+
+  startBtn.addEventListener('click', start);
+  flipBtn.addEventListener('click', async () => {
+    facingMode = (facingMode === 'user') ? 'environment' : 'user';
+    await start();
+  });
+
+  // auto-start on user gesture (mobile Safari needs a gesture; we bind to first touch/click)
+  const gestureStart = () => { start(); window.removeEventListener('pointerdown', gestureStart); window.removeEventListener('keydown', gestureStart); };
+  window.addEventListener('pointerdown', gestureStart, { once: true });
+  window.addEventListener('keydown', gestureStart, { once: true });
+})();
+</script>
+</body>
+</html>
